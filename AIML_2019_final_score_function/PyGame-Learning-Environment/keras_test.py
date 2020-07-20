@@ -1,0 +1,249 @@
+# thanks to @edersantana and @fchollet for suggestions & help.
+
+import numpy as np
+from ple import PLE  # our environment
+#from ple.games.catcher import Catcher
+import pygame.display
+from ple.games.waterworld import WaterWorld
+import math
+from keras.models import Sequential
+from keras.layers import Dense, LSTM, TimeDistributed, Dropout
+from keras.optimizers import SGD,Adam
+
+from example_support import ExampleAgent, ReplayMemory, loop_play_forever
+
+
+class Agent(ExampleAgent):
+    """
+        Our agent takes 1D inputs which are flattened.
+        We define a full connected model below.
+    """
+
+    def __init__(self, *args, **kwargs):
+        ExampleAgent.__init__(self, *args, **kwargs)
+
+        self.state_dim = self.env.getGameStateDims()
+        self.timesteps = 4 
+        self.state_shape =  np.prod((num_frames,) + self.state_dim) 
+        self.input_shape = (batch_size, self.timesteps,  self.state_shape)
+
+    def build_model(self):
+         model = Sequential()
+
+         # Adding the first LSTM layer and some Dropout regularisation
+         model.add(LSTM(units = 32 , return_sequences = True, batch_input_shape = self.input_shape ))
+         model.add(Dropout(0.2))
+
+         # Adding a second LSTM layer and some Dropout regularisation
+         #model.add(LSTM(units = 32, return_sequences = True))
+         #model.add(Dropout(0.2))
+
+         # Adding a third LSTM layer and some Dropout regularisation
+         #model.add(LSTM(units = 32, return_sequences = True))
+         #model.add(Dropout(0.2))
+
+         # Adding a fourth LSTM layer and some Dropout regularisation
+         model.add(LSTM(units = 32))
+         model.add(Dropout(0.2))
+
+         # For the output sequense
+         model.add(Dense(kernel_initializer="he_uniform", activation="relu", input_dim=self.state_shape, units=32))
+         #model.add(Dense(512, kernel_initializer="he_uniform", activation="relu"))
+         model.add(Dense(units = self.num_actions, kernel_initializer="he_uniform", activation="linear"))
+         model.compile(loss="mean_absolute_error", optimizer = Adam(lr=self.lr))
+         model.summary()
+
+         self.model = model
+
+    def save_weights(self, filepath, overwrite=False):
+        self.model.save_weights(filepath, overwrite=overwrite)
+
+def score_function(color, time):
+    score = 0 
+    time = time / 100
+    
+    if color == 'G': # Green
+        score = 5*math.cos(time)
+
+    elif color == 'R': # Red
+        sign = 1.0
+        tmp = math.cos(time)+math.sin(time)
+        if tmp < 0 :                
+            sign = -1.0
+            score = 5*sign*(tmp**2)/2
+
+    elif color == 'Y': # Yellow
+        score = 5*math.sin(time)
+
+    return int(score) 
+
+def nv_state_preprocessor(state):
+    """
+        This preprocesses our state from PLE. We rescale the values to be between
+        0,1 and -1,1.
+    """
+
+    # taken by inspection of source code. Better way is on its way!
+    # max_values = np.array([64.0, 20.0, 64.0, 64.0])
+    colors = ['G','R','Y']
+    val = state.values()
+    x_pos = state['player_x']/256.0
+    y_pos = state['player_y']/256.0
+    x_vel = state['player_velocity_x']/64.0
+    y_vel = state['player_velocity_y']/64.0
+    time = state['time']
+
+    creep_pos = state['creep_pos']
+    all_pos = np.empty((0,2))
+
+    for color in colors:
+        for position in creep_pos[color]:
+            pos = np.array(position)/256.0
+            all_pos = np.append(all_pos, [[color, pos]], axis = 0)
+
+    #green, red, yellow = score_function(time)
+
+    creep_dist = state['creep_dist']
+
+    all_pos = np.array(state['creep_pos'].values())/256.0    
+
+    all_dist = np.empty((0,2))
+    for color in colors:
+        for distance in creep_dist[color]:
+            dist = np.array(distance)/362.1
+            all_dist = np.append(all_dist, [[color, dist]], axis = 0)
+    
+    res_score = 0
+    for color in colors:
+        col_dist = [dist[1] for dist in all_dist if dist[0] == color]
+        col_score = score_function( color , time ) + 5 
+        res_score += float(col_score) * float(min(col_dist)) 
+     #print "res_score {}".format(res_score)
+
+    all_dist = all_dist[ all_dist[:,1].argsort() ]
+    prim_score = 0
+    for dist in all_dist[:3] :
+        #print "dist:{}".format(dist)
+        color_score = score_function(dist[0],time) + 5
+        prim_score += float(color_score) * float(dist[1])
+    #print "sorted all dist:{}".format(all_dist)
+
+    alpha = 1
+    all_state = np.array([x_pos,y_pos,x_vel,y_vel, 
+                alpha * prim_score**2, 
+                alpha * res_score**2, 
+                alpha * float(all_dist[0][1]),
+        alpha * float(all_dist[1][1]),
+        alpha * float(all_dist[2][1]),
+        alpha * sum( [ float(dist[1]) for dist in all_dist ] ),
+                 ])
+
+    return all_state.flatten()
+
+if __name__ == "__main__":
+    # this takes about 15 epochs to converge to something that performs decently.
+    # feel free to play with the parameters below.
+
+    # training parameters
+    num_epochs = 300
+    num_steps_train = 15000  # steps per epoch of training
+    num_steps_test = 3000  # steps per epoch of testing
+    num_steps = 3000
+    update_frequency = 10  # step frequency of model training/updates
+
+    # agent settings
+    batch_size = 32 
+    num_frames = 32 # number of frames in a 'state'
+    frame_skip = 2 
+
+    # percentage of time we perform a random action, help exploration.
+    epsilon = 0.15
+    epsilon_steps = 30000  # decay steps
+    epsilon_min = 0.1
+    lr = 1e-4
+    discount = 0.95  # discount factor
+    rng = np.random.RandomState(24)
+
+    # memory settings
+    max_memory_size = 100000
+    min_memory_size = 1000  # number needed before model training starts
+
+    epsilon_rate = (epsilon - epsilon_min) / epsilon_steps
+
+    # PLE takes our game and the state_preprocessor. It will process the state
+    # for our agent.
+    game = WaterWorld()
+    env = PLE(game, fps=60, state_preprocessor=nv_state_preprocessor)
+    agent = Agent(env, batch_size, num_frames, frame_skip, lr, discount, rng)
+    agent.build_model()
+
+    memory = ReplayMemory(max_memory_size, min_memory_size)
+
+    env.init()
+
+    for epoch in range(1, num_epochs + 1):
+        steps, num_episodes = 0, 0
+        losses, rewards = [], []
+        env.display_screen = False
+
+        # training loop
+        while steps < num_steps_train:
+              episode_reward = 0.0
+              agent.start_episode()
+
+              while env.game_over() == False and steps < num_steps:
+                    if steps % 1000 == 0 : print("steps:{}".format(steps))
+                    state = env.getGameState()
+                    #if steps % 1000 == 0 : print "state: {}".format(state[:-4])
+                    reward, action = agent.act(state, epsilon=epsilon)
+                    memory.add([state, action, reward, env.game_over()])
+
+                    if steps % update_frequency == 0:
+                      loss = memory.train_agent_batch(agent)
+                      if loss is not None:
+                         losses.append(loss)
+                         epsilon = np.max([epsilon_min, epsilon - epsilon_rate])
+
+                    episode_reward += reward
+                    steps += 1
+
+              rewards.append(episode_reward)
+              num_episodes += 1
+              agent.end_episode()
+
+        print "\nTrain Epoch {:02d}: Epsilon {:0.4f} | Avg. Loss {:0.3f} | Avg. Reward {:0.3f}".format(epoch, epsilon, np.mean(losses), np.sum(rewards) / num_episodes)
+
+        steps, num_episodes = 0, 0
+        losses, rewards = [], []
+
+        # display the screen
+        env.display_screen = False
+
+        # slow it down so we can watch it fail!
+        env.force_fps = False
+
+        # testing loop
+        while steps < num_steps_tests:
+            episode_reward = 0.0
+            agent.start_episode()
+
+            while nv.game_over() == False and steps < num_steps:
+                state = env.getGameState()
+                reward, action = agent.act(state, epsilon=0.05)
+
+                episode_reward += reward
+                steps += 1
+
+                # done watching after 500 steps.
+                if steps > 500:
+                    env.force_fps = False
+                    env.display_screen = False 
+
+            rewards.append(episode_reward)
+            num_episodes += 1
+            agent.end_episode()
+
+        print "Test Epoch {:02d}: Best Reward {:0.3f} | Avg. Reward {:0.3f}".format(epoch, np.max(rewards), np.sum(rewards) / num_episodes)
+    agent.save_weights('./test3.csv')
+    print "\nTraining complete. Will loop forever playing!"
+    loop_play_forever(env, agent)
